@@ -21,10 +21,13 @@ func (c *Client) ErrorMessage(code int32) string {
 	if code == 0 {
 		return "OK"
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	msg := C.krb5_get_error_message(c.ctx, C.krb5_error_code(code))
-	defer C.krb5_free_error_message(c.ctx, msg)
+	k, err := c.acquire()
+	if err != nil {
+		return fmt.Sprintf("krb5 error %d", code)
+	}
+	defer c.release(k)
+	msg := C.krb5_get_error_message(k.ctx, C.krb5_error_code(code))
+	defer C.krb5_free_error_message(k.ctx, msg)
 	return C.GoString(msg)
 }
 
@@ -61,13 +64,16 @@ func (s CredentialSummary) String() string {
 // KCM_OP_STORE request) just far enough to describe it in a log line.
 // Nothing is stored and no key material is copied out.
 func (c *Client) SummarizeCredential(wire []byte) (CredentialSummary, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	creds, err := c.unmarshalCreds(wire)
+	k, err := c.acquire()
 	if err != nil {
 		return CredentialSummary{}, err
 	}
-	defer C.krb5_free_creds(c.ctx, creds)
+	defer c.release(k)
+	creds, err := k.unmarshalCreds(wire)
+	if err != nil {
+		return CredentialSummary{}, err
+	}
+	defer C.krb5_free_creds(k.ctx, creds)
 	return CredentialSummary{
 		Client:      readPrincipal(creds.client),
 		Server:      readPrincipal(creds.server),
@@ -87,13 +93,16 @@ func (c *Client) SummarizeCredential(wire []byte) (CredentialSummary, error) {
 // is untouched. It exists for tests, which cannot use cgo directly, to
 // manufacture a near-expiry entry.
 func (c *Client) withEndTime(wire []byte, end time.Time) ([]byte, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	creds, err := c.unmarshalCreds(wire)
+	k, err := c.acquire()
 	if err != nil {
 		return nil, err
 	}
-	defer C.krb5_free_creds(c.ctx, creds)
+	defer c.release(k)
+	creds, err := k.unmarshalCreds(wire)
+	if err != nil {
+		return nil, err
+	}
+	defer C.krb5_free_creds(k.ctx, creds)
 	creds.times.endtime = C.krb5_timestamp(end.Unix())
-	return c.marshalCreds(creds)
+	return k.marshalCreds(creds)
 }

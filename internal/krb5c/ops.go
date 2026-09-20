@@ -27,63 +27,83 @@ type Entry struct {
 // marshals the credential to wire format, derives its UUID, and invokes
 // fn; fn returns true to stop early. cred is only valid for the
 // duration of the fn call.
-func (c *Client) forEachEntry(fn func(cred *C.krb5_creds, wire []byte, uuid kcmproto.UUID) bool) error {
+//
+// Walking is safe alongside other contexts' operations on the cache:
+// libkrb5's MEMORY: cursor is generation-checked (a re-initialise ends
+// the walk early) and removals leave the link in place, so the walk
+// never touches freed memory.
+func (k *kctx) forEachEntry(fn func(cred *C.krb5_creds, wire []byte, uuid kcmproto.UUID) bool) error {
 	var cursor C.krb5_cc_cursor
-	if code := C.krb5_cc_start_seq_get(c.ctx, c.cc, &cursor); code != 0 {
-		return newError(c.ctx, code)
+	if code := C.krb5_cc_start_seq_get(k.ctx, k.cc, &cursor); code != 0 {
+		return newError(k.ctx, code)
 	}
 	for {
 		var cred C.krb5_creds
-		code := C.krb5_cc_next_cred(c.ctx, c.cc, &cursor, &cred)
+		code := C.krb5_cc_next_cred(k.ctx, k.cc, &cursor, &cred)
 		if int32(code) == CCEnd {
 			break
 		}
 		if code != 0 {
-			C.krb5_cc_end_seq_get(c.ctx, c.cc, &cursor)
-			return newError(c.ctx, code)
+			C.krb5_cc_end_seq_get(k.ctx, k.cc, &cursor)
+			return newError(k.ctx, code)
 		}
-		if C.krb5_is_config_principal(c.ctx, cred.server) != 0 {
-			C.krb5_free_cred_contents(c.ctx, &cred)
+		if C.krb5_is_config_principal(k.ctx, cred.server) != 0 {
+			C.krb5_free_cred_contents(k.ctx, &cred)
 			continue
 		}
-		wire, err := c.marshalCreds(&cred)
+		wire, err := k.marshalCreds(&cred)
 		if err != nil {
-			C.krb5_free_cred_contents(c.ctx, &cred)
-			C.krb5_cc_end_seq_get(c.ctx, c.cc, &cursor)
+			C.krb5_free_cred_contents(k.ctx, &cred)
+			C.krb5_cc_end_seq_get(k.ctx, k.cc, &cursor)
 			return err
 		}
 		stop := fn(&cred, wire, uuidOf(wire))
-		C.krb5_free_cred_contents(c.ctx, &cred)
+		C.krb5_free_cred_contents(k.ctx, &cred)
 		if stop {
 			break
 		}
 	}
-	return newError(c.ctx, C.krb5_cc_end_seq_get(c.ctx, c.cc, &cursor))
+	return newError(k.ctx, C.krb5_cc_end_seq_get(k.ctx, k.cc, &cursor))
 }
 
 // DefaultPrincipal returns the working cache's client principal (the
 // identity from the TGT it was seeded with, or set by a later
 // Initialize call).
 func (c *Client) DefaultPrincipal() (kcmproto.Principal, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	var princ C.krb5_principal
-	if code := C.krb5_cc_get_principal(c.ctx, c.cc, &princ); code != 0 {
-		return kcmproto.Principal{}, newError(c.ctx, code)
+	k, err := c.acquire()
+	if err != nil {
+		return kcmproto.Principal{}, err
 	}
-	defer C.krb5_free_principal(c.ctx, princ)
+	defer c.release(k)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return k.defaultPrincipal()
+}
+
+func (k *kctx) defaultPrincipal() (kcmproto.Principal, error) {
+	var princ C.krb5_principal
+	if code := C.krb5_cc_get_principal(k.ctx, k.cc, &princ); code != 0 {
+		return kcmproto.Principal{}, newError(k.ctx, code)
+	}
+	defer C.krb5_free_principal(k.ctx, princ)
 	return readPrincipal(princ), nil
 }
 
 // ListEntries returns every real credential currently in the working
 // cache (the TGT plus any acquired or pre-existing service tickets).
 func (c *Client) ListEntries() ([]Entry, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.maintain(time.Now())
+	k, err := c.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer c.release(k)
+	c.maintain(k, time.Now())
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	var entries []Entry
 	var redErr error
-	err := c.forEachEntry(func(cred *C.krb5_creds, wire []byte, uuid kcmproto.UUID) bool {
+	err = k.forEachEntry(func(cred *C.krb5_creds, wire []byte, uuid kcmproto.UUID) bool {
 		server := readPrincipal(cred.server)
 		w := wire
 		if isTGTServer(server) {
@@ -91,7 +111,7 @@ func (c *Client) ListEntries() ([]Entry, error) {
 			// session key so a listing client cannot use it. The UUID is
 			// still derived from the true credential, so GET_CRED_BY_UUID
 			// stays consistent with this list.
-			if w, redErr = c.marshalTGTForListing(cred); redErr != nil {
+			if w, redErr = c.marshalTGTForListing(k, cred); redErr != nil {
 				return true
 			}
 		}
@@ -110,13 +130,19 @@ func (c *Client) ListEntries() ([]Entry, error) {
 
 // EntryByUUID returns the single entry matching uuid, if present.
 func (c *Client) EntryByUUID(uuid kcmproto.UUID) (Entry, bool, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.maintain(time.Now())
+	k, err := c.acquire()
+	if err != nil {
+		return Entry{}, false, err
+	}
+	defer c.release(k)
+	c.maintain(k, time.Now())
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	var found Entry
 	ok := false
 	var redErr error
-	err := c.forEachEntry(func(cred *C.krb5_creds, wire []byte, u kcmproto.UUID) bool {
+	err = k.forEachEntry(func(cred *C.krb5_creds, wire []byte, u kcmproto.UUID) bool {
 		if u != uuid {
 			return false
 		}
@@ -125,7 +151,7 @@ func (c *Client) EntryByUUID(uuid kcmproto.UUID) (Entry, bool, error) {
 		if isTGTServer(server) {
 			// See ListEntries: the TGT is listable but its session key is
 			// withheld from the returned credential.
-			if w, redErr = c.marshalTGTForListing(cred); redErr != nil {
+			if w, redErr = c.marshalTGTForListing(k, cred); redErr != nil {
 				return true
 			}
 		}
@@ -142,12 +168,17 @@ func (c *Client) EntryByUUID(uuid kcmproto.UUID) (Entry, bool, error) {
 // RemoveByUUID removes the entry matching uuid, if present. It reports
 // whether an entry was found and removed.
 func (c *Client) RemoveByUUID(uuid kcmproto.UUID) (bool, error) {
+	k, err := c.acquire()
+	if err != nil {
+		return false, err
+	}
+	defer c.release(k)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	var wire []byte
 	found := false
-	err := c.forEachEntry(func(cred *C.krb5_creds, w []byte, u kcmproto.UUID) bool {
+	err = k.forEachEntry(func(cred *C.krb5_creds, w []byte, u kcmproto.UUID) bool {
 		if u != uuid {
 			return false
 		}
@@ -162,13 +193,13 @@ func (c *Client) RemoveByUUID(uuid kcmproto.UUID) (bool, error) {
 	// Re-decode the found entry into a fresh krb5_creds to use as the
 	// match template for removal, rather than mutating the cache while
 	// a sequential-read cursor over it might still be settling.
-	creds, err := c.unmarshalCreds(wire)
+	creds, err := k.unmarshalCreds(wire)
 	if err != nil {
 		return false, err
 	}
-	defer C.krb5_free_creds(c.ctx, creds)
-	if code := C.krb5_cc_remove_cred(c.ctx, c.cc, 0, creds); code != 0 {
-		return false, newError(c.ctx, code)
+	defer C.krb5_free_creds(k.ctx, creds)
+	if code := C.krb5_cc_remove_cred(k.ctx, k.cc, 0, creds); code != 0 {
+		return false, newError(k.ctx, code)
 	}
 	return true, nil
 }
@@ -181,7 +212,7 @@ func (c *Client) RemoveByUUID(uuid kcmproto.UUID) (bool, error) {
 // called (e.g. via defer) once the template is no longer needed,
 // whether or not err is set - it releases whatever was allocated
 // before the error occurred.
-func (c *Client) buildMatchTemplate(mc kcmproto.MatchCredential) (creds C.krb5_creds, cleanup func(), err error) {
+func (k *kctx) buildMatchTemplate(mc kcmproto.MatchCredential) (creds C.krb5_creds, cleanup func(), err error) {
 	var toFree []func()
 	cleanup = func() {
 		for i := len(toFree) - 1; i >= 0; i-- {
@@ -190,34 +221,34 @@ func (c *Client) buildMatchTemplate(mc kcmproto.MatchCredential) (creds C.krb5_c
 	}
 
 	if mc.HasClient {
-		p, perr := c.buildPrincipal(mc.Client)
+		p, perr := k.buildPrincipal(mc.Client)
 		if perr != nil {
 			return creds, cleanup, fmt.Errorf("client principal: %w", perr)
 		}
 		creds.client = p
-		toFree = append(toFree, func() { C.krb5_free_principal(c.ctx, p) })
+		toFree = append(toFree, func() { C.krb5_free_principal(k.ctx, p) })
 	} else {
 		// The MIT client typically omits the client principal in a
 		// match-credential, relying on it defaulting to the cache's own
 		// identity - which is what every credential in this daemon's
 		// single working cache shares anyway.
 		var p C.krb5_principal
-		if code := C.krb5_cc_get_principal(c.ctx, c.cc, &p); code != 0 {
-			return creds, cleanup, newError(c.ctx, code)
+		if code := C.krb5_cc_get_principal(k.ctx, k.cc, &p); code != 0 {
+			return creds, cleanup, newError(k.ctx, code)
 		}
 		creds.client = p
-		toFree = append(toFree, func() { C.krb5_free_principal(c.ctx, p) })
+		toFree = append(toFree, func() { C.krb5_free_principal(k.ctx, p) })
 	}
 
 	if !mc.HasServer {
 		return creds, cleanup, fmt.Errorf("match-credential has no server principal")
 	}
-	p, perr := c.buildPrincipal(mc.Server)
+	p, perr := k.buildPrincipal(mc.Server)
 	if perr != nil {
 		return creds, cleanup, fmt.Errorf("server principal: %w", perr)
 	}
 	creds.server = p
-	toFree = append(toFree, func() { C.krb5_free_principal(c.ctx, p) })
+	toFree = append(toFree, func() { C.krb5_free_principal(k.ctx, p) })
 
 	if mc.HasSessionKey {
 		creds.keyblock.enctype = C.krb5_enctype(mc.KeyType)
@@ -260,6 +291,13 @@ func (c *Client) buildMatchTemplate(mc kcmproto.MatchCredential) (creds C.krb5_c
 // MIT client would see a cache-miss on a "cache only" retrieve and try
 // to obtain the ticket itself from its own local TGT, which does not
 // exist (the only TGT lives inside this daemon).
+//
+// Retrieves run concurrently: the KDC round trip happens under the
+// read lock, so it only ever waits for a TGT swap or cache reload, not
+// for other clients. Requests for the same credential that overlap are
+// coalesced into one TGS-REQ (see flightGroup), which also keeps the
+// working cache free of duplicate entries - a MEMORY: cache appends on
+// store without checking for an existing match.
 func (c *Client) Retrieve(mc kcmproto.MatchCredential) ([]byte, error) {
 	// The TGT is listable but never retrievable: a client that could pull
 	// it (or a foreign/cross-realm TGT) would hold the session key needed
@@ -274,19 +312,32 @@ func (c *Client) Retrieve(mc kcmproto.MatchCredential) ([]byte, error) {
 		}
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	k, err := c.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer c.release(k)
 
 	// Renew/reload the TGT if needed and evict stale service tickets
 	// first, so the lookup below misses on anything too close to expiry
 	// and fetches a fresh ticket instead of handing back the old one.
 	now := time.Now()
-	c.maintain(now)
+	c.maintain(k, now)
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if err := c.tgtError(now); err != nil {
 		return nil, err
 	}
 
-	inCreds, cleanup, err := c.buildMatchTemplate(mc)
+	return c.flights.do(matchKey(mc), func() ([]byte, error) {
+		return k.getCredentials(mc)
+	})
+}
+
+// getCredentials performs the cache lookup / TGS exchange for Retrieve.
+func (k *kctx) getCredentials(mc kcmproto.MatchCredential) ([]byte, error) {
+	inCreds, cleanup, err := k.buildMatchTemplate(mc)
 	defer cleanup()
 	if err != nil {
 		return nil, err
@@ -297,18 +348,39 @@ func (c *Client) Retrieve(mc kcmproto.MatchCredential) ([]byte, error) {
 	// tickets and the working cache never holds any, so answer not-found
 	// directly rather than letting krb5_get_credentials ask the KDC for
 	// a principal that cannot exist.
-	if C.krb5_is_config_principal(c.ctx, inCreds.server) != 0 {
+	if C.krb5_is_config_principal(k.ctx, inCreds.server) != 0 {
 		return nil, &Error{Code: CCNotFound, Message: "Matching credential not found"}
 	}
 
 	var outCreds *C.krb5_creds
-	code := C.krb5_get_credentials(c.ctx, 0, c.cc, &inCreds, &outCreds)
+	code := C.krb5_get_credentials(k.ctx, 0, k.cc, &inCreds, &outCreds)
 	if code != 0 {
-		return nil, newError(c.ctx, code)
+		return nil, newError(k.ctx, code)
 	}
-	defer C.krb5_free_creds(c.ctx, outCreds)
+	defer C.krb5_free_creds(k.ctx, outCreds)
 
-	return c.marshalCreds(outCreds)
+	return k.marshalCreds(outCreds)
+}
+
+// matchKey identifies a RETRIEVE for coalescing: two requests with the
+// same key would build the same match template (see buildMatchTemplate
+// for which fields that uses) and so can share one answer.
+func matchKey(mc kcmproto.MatchCredential) string {
+	key := ""
+	if mc.HasClient {
+		key = mc.Client.UnparseName()
+	}
+	key += "\x00" + mc.Server.UnparseName()
+	if mc.HasSessionKey {
+		key += fmt.Sprintf("\x00enctype=%d", mc.KeyType)
+	}
+	if mc.IsSKey {
+		key += "\x00skey"
+	}
+	if mc.HasSecondTicket && len(mc.SecondTicket) > 0 {
+		key += "\x00second=" + string(mc.SecondTicket)
+	}
+	return key
 }
 
 // RemoveMatching asks libkrb5's own krb5_cc_remove_cred to find and
@@ -324,15 +396,20 @@ func (c *Client) Retrieve(mc kcmproto.MatchCredential) ([]byte, error) {
 // practice (kdestroy uses KCM_OP_DESTROY instead), so this is an
 // accepted v1 simplification rather than a correctness requirement.
 func (c *Client) RemoveMatching(mc kcmproto.MatchCredential) error {
+	k, err := c.acquire()
+	if err != nil {
+		return err
+	}
+	defer c.release(k)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	inCreds, cleanup, err := c.buildMatchTemplate(mc)
+	inCreds, cleanup, err := k.buildMatchTemplate(mc)
 	defer cleanup()
 	if err != nil {
 		return err
 	}
-	if code := C.krb5_cc_remove_cred(c.ctx, c.cc, 0, &inCreds); code != 0 {
-		return newError(c.ctx, code)
+	if code := C.krb5_cc_remove_cred(k.ctx, k.cc, 0, &inCreds); code != 0 {
+		return newError(k.ctx, code)
 	}
 	return nil
 }
@@ -343,28 +420,31 @@ func (c *Client) RemoveMatching(mc kcmproto.MatchCredential) error {
 // KCM: cache does after INITIALIZE), and is held under the same rules
 // as one loaded from the source file.
 func (c *Client) Store(credWire []byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	creds, err := c.unmarshalCreds(credWire)
+	k, err := c.acquire()
 	if err != nil {
 		return err
 	}
-	defer C.krb5_free_creds(c.ctx, creds)
+	defer c.release(k)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	creds, err := k.unmarshalCreds(credWire)
+	if err != nil {
+		return err
+	}
+	defer C.krb5_free_creds(k.ctx, creds)
 
 	client, server := readPrincipal(creds.client), readPrincipal(creds.server)
 	if isLocalTGT(client, server) {
-		var princ C.krb5_principal
-		if code := C.krb5_cc_get_principal(c.ctx, c.cc, &princ); code != 0 {
-			return newError(c.ctx, code)
+		mine, err := k.defaultPrincipal()
+		if err != nil {
+			return err
 		}
-		mine := readPrincipal(princ).UnparseName() == client.UnparseName()
-		C.krb5_free_principal(c.ctx, princ)
-		if mine {
-			info, err := c.tgtInfoFrom(creds)
+		if mine.UnparseName() == client.UnparseName() {
+			info, err := k.tgtInfoFrom(creds)
 			if err != nil {
 				return err
 			}
-			if err := c.setTGT(creds, info); err != nil {
+			if err := c.setTGT(k, info); err != nil {
 				return err
 			}
 			c.log.Info("adopted a stored ticket-granting ticket", "principal", client.UnparseName(),
@@ -372,8 +452,8 @@ func (c *Client) Store(credWire []byte) error {
 			return nil
 		}
 	}
-	if code := C.krb5_cc_store_cred(c.ctx, c.cc, creds); code != 0 {
-		return newError(c.ctx, code)
+	if code := C.krb5_cc_store_cred(k.ctx, k.cc, creds); code != 0 {
+		return newError(k.ctx, code)
 	}
 	return nil
 }
@@ -382,15 +462,20 @@ func (c *Client) Store(credWire []byte) error {
 // KCM_OP_INITIALIZE. Like a real ccache, this discards any existing
 // entries.
 func (c *Client) Initialize(p kcmproto.Principal) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	princ, err := c.buildPrincipal(p)
+	k, err := c.acquire()
 	if err != nil {
 		return err
 	}
-	defer C.krb5_free_principal(c.ctx, princ)
-	if code := C.krb5_cc_initialize(c.ctx, c.cc, princ); code != 0 {
-		return newError(c.ctx, code)
+	defer c.release(k)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	princ, err := k.buildPrincipal(p)
+	if err != nil {
+		return err
+	}
+	defer C.krb5_free_principal(k.ctx, princ)
+	if code := C.krb5_cc_initialize(k.ctx, k.cc, princ); code != 0 {
+		return newError(k.ctx, code)
 	}
 	// The TGT went with the rest of the entries. A later STORE of a TGT
 	// (kinit into the KCM: cache) or a changed source ccache brings one

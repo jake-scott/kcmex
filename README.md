@@ -118,6 +118,7 @@ subsequent `klist` output.
 | `-socket` | `$XDG_RUNTIME_DIR/kcmex/kcm.socket`, else `$TMPDIR/kcmex-<uid>/kcm.socket` | Unix domain socket to listen on. Any stale socket file is removed first, and the new one is created with mode `0600`. |
 | `-log-level` | `info` | One of `debug`, `info`, `warn`, `error`. Logs go to stderr. |
 | `-min-ticket-life` | `5m` | Never hand a client a service ticket with less than this much lifetime left; discard it and fetch a fresh one instead. Also the point at which the source file is consulted for a newer TGT. |
+| `-max-concurrent` | `16` | How many client requests may be served at the same time. Requests beyond this wait for a slot. See [Concurrency](#concurrency). |
 
 The daemon shuts down cleanly on `SIGINT` or `SIGTERM`.
 
@@ -170,6 +171,37 @@ expired TGT.
 Running `kinit` directly into the `KCM:` cache also works: the client's
 `INITIALIZE` clears the working cache and the `STORE` of the new TGT is adopted
 by the daemon under the same rules as one loaded from a file.
+
+## Concurrency
+
+Every client connection is served by its own goroutine, and requests from
+different clients proceed in parallel: a client waiting on a slow KDC does
+not hold up `klist` in another terminal, or a second client asking for a
+different service.
+
+Two properties of MIT libkrb5 make this work:
+
+- A `krb5_context` must only be used by one thread at a time, so the daemon
+  keeps a pool of them (up to `-max-concurrent`) and each request borrows one.
+  Creating a context is cheap (the parsed `krb5.conf` is cached process-wide),
+  so the pool fills lazily on demand.
+- `MEMORY:` credential caches are process-global, keyed by name, and lock
+  each individual operation internally. All the pooled contexts resolve the
+  same working cache, so a ticket one request fetches is immediately visible
+  to every other, and lookups, stores and iteration from different contexts
+  may overlap safely.
+
+A read/write lock on top of that covers only what libkrb5 does not: the
+daemon's own bookkeeping, and the few multi-step cache changes whose
+half-done state must never be observed (swapping in a renewed or freshly
+loaded TGT re-initialises or rewrites the cache). Requests hold it for
+reading, including across the TGS exchange, and only those changes take it
+for writing. TGT renewal talks to the KDC without holding the lock at all.
+
+Concurrent requests for the same service ticket are coalesced: one TGS-REQ
+is sent and every waiting client receives its result, which also keeps the
+cache free of duplicate entries (a `MEMORY:` cache appends on store without
+looking for an existing match).
 
 ## Security model
 
