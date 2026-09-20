@@ -41,6 +41,13 @@ const (
 	TktExpired int32 = -1765328352 // KRB5KRB_AP_ERR_TKT_EXPIRED
 )
 
+// workingCacheName is the daemon's private working cache. MEMORY:
+// caches are process-global in libkrb5, keyed by name: every
+// krb5_context that resolves this name gets a handle on the same
+// underlying cache, which is what lets the pooled contexts below share
+// one set of credentials.
+const workingCacheName = "MEMORY:kcmex"
+
 // Error wraps a krb5_error_code. Code is the raw numeric code as MIT
 // krb5 defines it; kcmex sends it back verbatim as a KCM reply code
 // since the MIT client already knows how to interpret it (it is the
@@ -54,6 +61,10 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("krb5: %s (%d)", e.Message, e.Code)
 }
 
+// newError converts a krb5 return code into an Error. It must be called
+// with the context that produced the code, and before that context is
+// used for anything else: libkrb5 keeps the extended error message in
+// the context, tied to the last failing call.
 func newError(ctx C.krb5_context, code C.krb5_error_code) error {
 	if code == 0 {
 		return nil
@@ -63,31 +74,79 @@ func newError(ctx C.krb5_context, code C.krb5_error_code) error {
 	return &Error{Code: int32(code), Message: C.GoString(msg)}
 }
 
-// Client is the daemon's Kerberos engine: one krb5_context and one
-// private in-memory (MEMORY:) credential cache, seeded at startup from
-// a real FILE ccache holding the user's TGT, and added to over time as
-// service tickets are acquired.
+// kctx is one krb5_context together with its handle on the working
+// cache. A krb5_context may only ever be used by one thread at a time,
+// so a Client keeps a pool of them and each operation borrows one for
+// its duration (see Client.acquire). The cache handles all refer to the
+// same MEMORY: cache; libkrb5 serialises individual operations on it
+// with a lock of its own, so two contexts may store into, read from and
+// iterate over it at the same time.
+type kctx struct {
+	ctx C.krb5_context
+	cc  C.krb5_ccache
+}
+
+// newKctx initialises a fresh krb5_context and resolves the working
+// cache in it. This is cheap: the profile library caches parsed
+// krb5.conf trees process-wide, so only the first call actually reads
+// the file.
+func newKctx() (*kctx, error) {
+	var ctx C.krb5_context
+	if code := C.krb5_init_context(&ctx); code != 0 {
+		return nil, fmt.Errorf("krb5_init_context failed (code %d)", int32(code))
+	}
+	name := C.CString(workingCacheName)
+	defer C.free(unsafe.Pointer(name))
+	var cc C.krb5_ccache
+	if code := C.krb5_cc_resolve(ctx, name, &cc); code != 0 {
+		err := newError(ctx, code)
+		C.krb5_free_context(ctx)
+		return nil, fmt.Errorf("resolving working cache: %w", err)
+	}
+	return &kctx{ctx: ctx, cc: cc}, nil
+}
+
+func (k *kctx) free() {
+	C.krb5_cc_close(k.ctx, k.cc)
+	C.krb5_free_context(k.ctx)
+}
+
+// Client is the daemon's Kerberos engine: a pool of krb5_contexts
+// sharing one private in-memory (MEMORY:) credential cache, seeded at
+// startup from a real FILE ccache holding the user's TGT, and added to
+// over time as service tickets are acquired.
 //
 // The TGT is also tracked separately (see tgtInfo) so the daemon can
 // renew it before it expires, or pick up a newer one from the source
-// file after the user runs kinit again. All fields are guarded by mu; libkrb5's
-// krb5_context is not safe for concurrent use, so every operation,
-// including background maintenance, is serialised through it.
+// file after the user runs kinit again.
+//
+// Concurrency: requests run in parallel, up to the pool size. Each
+// borrows its own krb5_context (never shared between goroutines) and
+// the working cache's own internal locking keeps single libkrb5
+// operations on it safe. mu is then only needed for two things: the
+// Go-side fields below it, and multi-step cache changes whose
+// intermediate state must not be observed (swapping the TGT, or
+// re-initialising and reloading the cache). Those take mu for writing;
+// everything else - including the KDC round trip inside a RETRIEVE -
+// holds it for reading, so a slow KDC no longer stalls other clients.
 type Client struct {
-	mu  sync.Mutex
-	ctx C.krb5_context
-	cc  C.krb5_ccache
-	log *slog.Logger
+	sem  chan struct{} // one slot per context the pool may hold
+	free chan *kctx    // idle contexts
+	log  *slog.Logger
 
-	minLife time.Duration
+	closeOnce sync.Once
 
+	mu            sync.RWMutex
+	minLife       time.Duration
 	srcPath       string
 	ownerUID      int
 	lastFileCheck time.Time // when the source ccache was last re-read
+	tgt           *tgtInfo  // nil when no usable TGT is held
+	renewRetryAt  time.Time
+	renewBackoff  time.Duration
+	renewing      bool // a renewal exchange is in flight (outside mu)
 
-	tgt          *tgtInfo // nil when no usable TGT is held
-	renewRetryAt time.Time
-	renewBackoff time.Duration
+	flights flightGroup // coalesces identical concurrent RETRIEVEs
 }
 
 // Options configures Open.
@@ -101,6 +160,10 @@ type Options struct {
 	// OwnerUID is the uid the source ccache must be owned by whenever
 	// it is (re)read. Negative disables the check.
 	OwnerUID int
+	// MaxConcurrent bounds how many operations (and so how many
+	// krb5_contexts, each pinning an OS thread while it is inside
+	// libkrb5) may run at once. Zero means 16.
+	MaxConcurrent int
 	// Log receives maintenance events (renewals, reloads, evictions).
 	// Nil means slog.Default().
 	Log *slog.Logger
@@ -117,80 +180,96 @@ func Open(sourcePath string, opts Options) (*Client, error) {
 	if opts.MinTicketLife <= 0 {
 		opts.MinTicketLife = 5 * time.Minute
 	}
+	if opts.MaxConcurrent <= 0 {
+		opts.MaxConcurrent = 16
+	}
 	if opts.Log == nil {
 		opts.Log = slog.Default()
 	}
 
-	var ctx C.krb5_context
-	if code := C.krb5_init_context(&ctx); code != 0 {
-		return nil, fmt.Errorf("krb5_init_context failed (code %d)", int32(code))
-	}
-
 	uid, err := fileOwner(sourcePath)
 	if err != nil {
-		C.krb5_free_context(ctx)
 		return nil, err
 	}
 	if opts.OwnerUID >= 0 && uid >= 0 && uid != opts.OwnerUID {
-		C.krb5_free_context(ctx)
 		return nil, fmt.Errorf("ccache %q is owned by uid %d, not %d", sourcePath, uid, opts.OwnerUID)
+	}
+
+	k, err := newKctx()
+	if err != nil {
+		return nil, err
 	}
 
 	srcName := C.CString("FILE:" + sourcePath)
 	defer C.free(unsafe.Pointer(srcName))
 
 	var src C.krb5_ccache
-	if code := C.krb5_cc_resolve(ctx, srcName, &src); code != 0 {
-		err := newError(ctx, code)
-		C.krb5_free_context(ctx)
+	if code := C.krb5_cc_resolve(k.ctx, srcName, &src); code != 0 {
+		err := newError(k.ctx, code)
+		k.free()
 		return nil, fmt.Errorf("resolving source ccache %q: %w", sourcePath, err)
 	}
-	defer C.krb5_cc_close(ctx, src)
+	defer C.krb5_cc_close(k.ctx, src)
 
 	var princ C.krb5_principal
-	if code := C.krb5_cc_get_principal(ctx, src, &princ); code != 0 {
-		err := newError(ctx, code)
-		C.krb5_free_context(ctx)
+	if code := C.krb5_cc_get_principal(k.ctx, src, &princ); code != 0 {
+		err := newError(k.ctx, code)
+		k.free()
 		return nil, fmt.Errorf("reading default principal from %q: %w", sourcePath, err)
 	}
-	defer C.krb5_free_principal(ctx, princ)
+	defer C.krb5_free_principal(k.ctx, princ)
 
-	memName := C.CString("MEMORY:kcmex")
-	defer C.free(unsafe.Pointer(memName))
-
-	var mem C.krb5_ccache
-	if code := C.krb5_cc_resolve(ctx, memName, &mem); code != 0 {
-		err := newError(ctx, code)
-		C.krb5_free_context(ctx)
-		return nil, fmt.Errorf("creating working cache: %w", err)
-	}
-	if code := C.krb5_cc_initialize(ctx, mem, princ); code != 0 {
-		err := newError(ctx, code)
-		C.krb5_cc_close(ctx, mem)
-		C.krb5_free_context(ctx)
+	if code := C.krb5_cc_initialize(k.ctx, k.cc, princ); code != 0 {
+		err := newError(k.ctx, code)
+		k.free()
 		return nil, fmt.Errorf("initializing working cache: %w", err)
 	}
 
 	c := &Client{
-		ctx:      ctx,
-		cc:       mem,
+		sem:      make(chan struct{}, opts.MaxConcurrent),
+		free:     make(chan *kctx, opts.MaxConcurrent),
 		log:      opts.Log,
 		minLife:  opts.MinTicketLife,
 		srcPath:  sourcePath,
 		ownerUID: opts.OwnerUID,
 	}
 
-	tgt, err := c.loadFrom(src, time.Now())
+	tgt, err := c.loadFrom(k, src, time.Now())
 	if err != nil {
-		c.Close()
+		k.free()
 		return nil, fmt.Errorf("copying credentials from %q: %w", sourcePath, err)
 	}
 	c.tgt = tgt
 	if tgt == nil {
 		c.log.Warn("source ccache holds no ticket-granting ticket; waiting for kinit", "ccache", sourcePath)
 	}
+	c.free <- k
 
 	return c, nil
+}
+
+// acquire borrows a context from the pool, creating one if every idle
+// context is in use and the pool is not yet full, and blocking while
+// the pool is full. The caller must hand it back with release, and
+// must not hold it across a call that could re-enter acquire.
+func (c *Client) acquire() (*kctx, error) {
+	c.sem <- struct{}{}
+	select {
+	case k := <-c.free:
+		return k, nil
+	default:
+	}
+	k, err := newKctx()
+	if err != nil {
+		<-c.sem
+		return nil, err
+	}
+	return k, nil
+}
+
+func (c *Client) release(k *kctx) {
+	c.free <- k
+	<-c.sem
 }
 
 // TGTStatus describes the held TGT for logging. OK is false when there
@@ -203,8 +282,8 @@ type TGTStatus struct {
 
 // TGT reports the current TGT's lifetime.
 func (c *Client) TGT() TGTStatus {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if c.tgt == nil {
 		return TGTStatus{}
 	}
@@ -218,36 +297,36 @@ func (c *Client) TGT() TGTStatus {
 // loadFrom copies every non-config credential from src into the
 // working cache and returns the local TGT found there (nil if none).
 // The TGT goes in via storeTGT (renewable flag cleared); expired
-// service tickets are left behind. The caller holds c.mu, or c is not
-// yet shared.
-func (c *Client) loadFrom(src C.krb5_ccache, now time.Time) (*tgtInfo, error) {
+// service tickets are left behind. The caller holds c.mu for writing,
+// or c is not yet shared.
+func (c *Client) loadFrom(k *kctx, src C.krb5_ccache, now time.Time) (*tgtInfo, error) {
 	var tgt *tgtInfo
 	var cursor C.krb5_cc_cursor
-	if code := C.krb5_cc_start_seq_get(c.ctx, src, &cursor); code != 0 {
-		return nil, newError(c.ctx, code)
+	if code := C.krb5_cc_start_seq_get(k.ctx, src, &cursor); code != 0 {
+		return nil, newError(k.ctx, code)
 	}
 	for {
 		var cred C.krb5_creds
-		code := C.krb5_cc_next_cred(c.ctx, src, &cursor, &cred)
+		code := C.krb5_cc_next_cred(k.ctx, src, &cursor, &cred)
 		if int32(code) == CCEnd {
 			break
 		}
 		if code != 0 {
-			C.krb5_cc_end_seq_get(c.ctx, src, &cursor)
-			return nil, newError(c.ctx, code)
+			C.krb5_cc_end_seq_get(k.ctx, src, &cursor)
+			return nil, newError(k.ctx, code)
 		}
-		err := c.loadOne(&cred, now, &tgt)
-		C.krb5_free_cred_contents(c.ctx, &cred)
+		err := c.loadOne(k, &cred, now, &tgt)
+		C.krb5_free_cred_contents(k.ctx, &cred)
 		if err != nil {
-			C.krb5_cc_end_seq_get(c.ctx, src, &cursor)
+			C.krb5_cc_end_seq_get(k.ctx, src, &cursor)
 			return nil, err
 		}
 	}
-	return tgt, newError(c.ctx, C.krb5_cc_end_seq_get(c.ctx, src, &cursor))
+	return tgt, newError(k.ctx, C.krb5_cc_end_seq_get(k.ctx, src, &cursor))
 }
 
-func (c *Client) loadOne(cred *C.krb5_creds, now time.Time, tgt **tgtInfo) error {
-	if C.krb5_is_config_principal(c.ctx, cred.server) != 0 {
+func (c *Client) loadOne(k *kctx, cred *C.krb5_creds, now time.Time, tgt **tgtInfo) error {
+	if C.krb5_is_config_principal(k.ctx, cred.server) != 0 {
 		return nil
 	}
 	client, server := readPrincipal(cred.client), readPrincipal(cred.server)
@@ -255,11 +334,11 @@ func (c *Client) loadOne(cred *C.krb5_creds, now time.Time, tgt **tgtInfo) error
 		if *tgt != nil {
 			return nil // keep the first TGT; a FILE cache normally has one
 		}
-		info, err := c.tgtInfoFrom(cred)
+		info, err := k.tgtInfoFrom(cred)
 		if err != nil {
 			return err
 		}
-		if err := c.storeTGT(cred); err != nil {
+		if err := k.storeTGT(cred); err != nil {
 			return err
 		}
 		*tgt = info
@@ -268,7 +347,7 @@ func (c *Client) loadOne(cred *C.krb5_creds, now time.Time, tgt **tgtInfo) error
 	if !krbTime(cred.times.endtime).After(now) {
 		return nil // already expired; no point carrying it over
 	}
-	return newError(c.ctx, C.krb5_cc_store_cred(c.ctx, c.cc, cred))
+	return newError(k.ctx, C.krb5_cc_store_cred(k.ctx, k.cc, cred))
 }
 
 // krbTime converts a krb5_timestamp (seconds since the epoch, treated
@@ -280,19 +359,19 @@ func krbTime(ts C.krb5_timestamp) time.Time {
 	return time.Unix(int64(uint32(ts)), 0)
 }
 
-// Close releases the underlying krb5_context and working cache. The
-// Client must not be used afterwards.
+// Close waits for in-flight operations to finish, then releases every
+// pooled krb5_context and working-cache handle. The Client must not be
+// used afterwards; a second Close is a no-op.
 func (c *Client) Close() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.cc != nil {
-		C.krb5_cc_close(c.ctx, c.cc)
-		c.cc = nil
-	}
-	if c.ctx != nil {
-		C.krb5_free_context(c.ctx)
-		c.ctx = nil
-	}
+	c.closeOnce.Do(func() {
+		for i := 0; i < cap(c.sem); i++ {
+			c.sem <- struct{}{}
+		}
+		close(c.free)
+		for k := range c.free {
+			k.free()
+		}
+	})
 }
 
 // readPrincipal copies a library-owned krb5_principal into a plain Go
@@ -322,12 +401,17 @@ func readPrincipal(princ C.krb5_principal) kcmproto.Principal {
 // krb5_principal via krb5_parse_name (rather than poking at
 // krb5_principal_data fields by hand), so it can be freed normally with
 // krb5_free_principal. The caller must free the result.
-func (c *Client) buildPrincipal(p kcmproto.Principal) (C.krb5_principal, error) {
-	name := C.CString(p.UnparseName())
-	defer C.free(unsafe.Pointer(name))
+func (k *kctx) buildPrincipal(p kcmproto.Principal) (C.krb5_principal, error) {
+	return k.parseName(p.UnparseName())
+}
+
+// parseName wraps krb5_parse_name. The caller must free the result.
+func (k *kctx) parseName(name string) (C.krb5_principal, error) {
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
 	var princ C.krb5_principal
-	if code := C.krb5_parse_name(c.ctx, name, &princ); code != 0 {
-		return nil, newError(c.ctx, code)
+	if code := C.krb5_parse_name(k.ctx, cname, &princ); code != 0 {
+		return nil, newError(k.ctx, code)
 	}
 	return princ, nil
 }
@@ -336,12 +420,12 @@ func (c *Client) buildPrincipal(p kcmproto.Principal) (C.krb5_principal, error) 
 // krb5_get_credentials or read from the working cache) into the exact
 // bytes the KCM wire protocol expects for a credential, using MIT's own
 // public krb5_marshal_credentials - not a reimplementation.
-func (c *Client) marshalCreds(creds *C.krb5_creds) ([]byte, error) {
+func (k *kctx) marshalCreds(creds *C.krb5_creds) ([]byte, error) {
 	var data *C.krb5_data
-	if code := C.krb5_marshal_credentials(c.ctx, creds, &data); code != 0 {
-		return nil, newError(c.ctx, code)
+	if code := C.krb5_marshal_credentials(k.ctx, creds, &data); code != 0 {
+		return nil, newError(k.ctx, code)
 	}
-	defer C.krb5_free_data(c.ctx, data)
+	defer C.krb5_free_data(k.ctx, data)
 	return C.GoBytes(unsafe.Pointer(data.data), C.int(data.length)), nil
 }
 
@@ -356,7 +440,8 @@ func (c *Client) marshalCreds(creds *C.krb5_creds) ([]byte, error) {
 // This is how kcmex exposes the TGT without handing out the key that
 // would make it usable - the key is what a client needs to build the
 // AP-REQ authenticator inside a TGS-REQ, so a keyless TGT is inert.
-func (c *Client) marshalTGTForListing(creds *C.krb5_creds) ([]byte, error) {
+// The caller holds c.mu (reading c.tgt).
+func (c *Client) marshalTGTForListing(k *kctx, creds *C.krb5_creds) ([]byte, error) {
 	savedLen := creds.keyblock.length
 	savedContents := creds.keyblock.contents
 	savedFlags := creds.ticket_flags
@@ -365,7 +450,7 @@ func (c *Client) marshalTGTForListing(creds *C.krb5_creds) ([]byte, error) {
 	if c.tgt != nil && isLocalTGT(readPrincipal(creds.client), readPrincipal(creds.server)) {
 		creds.ticket_flags = C.krb5_flags(c.tgt.flags)
 	}
-	wire, err := c.marshalCreds(creds)
+	wire, err := k.marshalCreds(creds)
 	creds.keyblock.length = savedLen
 	creds.keyblock.contents = savedContents
 	creds.ticket_flags = savedFlags
@@ -384,7 +469,7 @@ func isTGTServer(server kcmproto.Principal) bool {
 // sent by the MIT client for a STORE request) back into a
 // library-allocated krb5_creds, using krb5_unmarshal_credentials. The
 // caller must free the result with krb5_free_creds.
-func (c *Client) unmarshalCreds(wire []byte) (*C.krb5_creds, error) {
+func (k *kctx) unmarshalCreds(wire []byte) (*C.krb5_creds, error) {
 	cData := C.CBytes(wire)
 	defer C.free(cData)
 	kd := C.krb5_data{
@@ -392,8 +477,8 @@ func (c *Client) unmarshalCreds(wire []byte) (*C.krb5_creds, error) {
 		data:   (*C.char)(cData),
 	}
 	var creds *C.krb5_creds
-	if code := C.krb5_unmarshal_credentials(c.ctx, &kd, &creds); code != 0 {
-		return nil, newError(c.ctx, code)
+	if code := C.krb5_unmarshal_credentials(k.ctx, &kd, &creds); code != 0 {
+		return nil, newError(k.ctx, code)
 	}
 	return creds, nil
 }

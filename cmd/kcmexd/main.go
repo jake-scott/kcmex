@@ -37,6 +37,7 @@ func run() int {
 		socketPath = flag.String("socket", defaultSocketPath(uid), "KCM Unix domain socket path to listen on")
 		logLevel   = flag.String("log-level", "info", "log level: debug, info, warn, error")
 		minLife    = flag.Duration("min-ticket-life", 5*time.Minute, "never hand out a service ticket with less than this much lifetime left; fetch a fresh one instead")
+		maxConc    = flag.Int("max-concurrent", 16, "maximum number of client requests served at the same time (each holds a libkrb5 context and, during a KDC exchange, an OS thread)")
 	)
 	flag.Parse()
 
@@ -56,6 +57,7 @@ func run() int {
 	krb, err := krb5c.Open(src, krb5c.Options{
 		MinTicketLife: *minLife,
 		OwnerUID:      uid,
+		MaxConcurrent: *maxConc,
 		Log:           log,
 	})
 	if err != nil {

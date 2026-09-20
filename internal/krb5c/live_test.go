@@ -45,6 +45,11 @@ func TestLive(t *testing.T) {
 	if c.tgt == nil {
 		t.Fatal("no TGT in ccache")
 	}
+	k, err := c.acquire() // a context of our own for calling internals directly
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.release(k)
 	fileTGTEnd := c.tgt.endTime
 	now := time.Now()
 
@@ -88,10 +93,7 @@ func TestLive(t *testing.T) {
 
 	// 3. Renewal replaces the TGT with a longer-lived one.
 	if c.tgt.renewable() {
-		c.mu.Lock()
-		err := c.renewTGT(now)
-		c.mu.Unlock()
-		if err != nil {
+		if err := c.renewTGT(k, now); err != nil {
 			t.Fatalf("renewTGT: %v", err)
 		}
 		if !c.tgt.endTime.After(fileTGTEnd) {
@@ -114,9 +116,7 @@ func TestLive(t *testing.T) {
 	if err := c.Store(short); err != nil {
 		t.Fatal(err)
 	}
-	c.mu.Lock()
-	c.sweep(now)
-	c.mu.Unlock()
+	c.sweep(k, now)
 	_, svcEntries = splitEntries(t, c, svc)
 	if len(svcEntries) != 1 || time.Unix(int64(uint32(svcEntries[0].EndTime)), 0).Sub(now) < 30*time.Minute {
 		t.Errorf("after sweep: %d %s entries (%+v), want only the long-lived one", len(svcEntries), svc, svcEntries)
@@ -165,17 +165,18 @@ func TestLive(t *testing.T) {
 	// 7. A file whose TGT is older than the (renewed) one held is left
 	//    alone, even when the held TGT is due for attention.
 	if c.tgt.renewable() {
+		if err := c.renewTGT(k, now); err != nil {
+			t.Fatalf("second renewTGT: %v", err)
+		}
 		c.mu.Lock()
-		err := c.renewTGT(now)
 		renewedEnd := c.tgt.endTime
 		c.tgt.startTime = now.Add(-20 * time.Hour) // make renewal "due" again
 		c.lastFileCheck = time.Time{}
-		c.maintain(now)
-		kept := c.tgt.endTime
 		c.mu.Unlock()
-		if err != nil {
-			t.Fatalf("second renewTGT: %v", err)
-		}
+		c.maintain(k, now)
+		c.mu.RLock()
+		kept := c.tgt.endTime
+		c.mu.RUnlock()
 		if kept.Before(renewedEnd) {
 			t.Errorf("maintain replaced a renewed TGT (ends %v) with the older file TGT (ends %v)", renewedEnd, kept)
 		}
